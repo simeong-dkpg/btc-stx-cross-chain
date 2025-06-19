@@ -247,3 +247,93 @@
         (ok true)
     )
 )
+
+;; Emergency withdrawal function for critical situations (admin only)
+(define-public (emergency-withdraw (amount uint) (recipient principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-DEPLOYER) (err ERROR-NOT-AUTHORIZED))
+        (asserts! (>= (var-get total-bridged-amount) amount) (err ERROR-INSUFFICIENT-BALANCE))
+        (asserts! (is-valid-principal recipient) (err ERROR-INVALID-RECIPIENT-ADDRESS))
+        
+        (let (
+            (current-balance (default-to u0 (map-get? bridge-balances recipient)))
+            (new-balance (+ current-balance amount))
+        )
+            (asserts! (> new-balance current-balance) (err ERROR-INVALID-AMOUNT))
+            (map-set bridge-balances recipient new-balance)
+            (ok true)
+        )
+    )
+)
+
+;; READ-ONLY QUERY FUNCTIONS
+
+;; Retrieves comprehensive deposit information by transaction hash
+(define-read-only (get-deposit (tx-hash (buff 32)))
+    (map-get? deposits {tx-hash: tx-hash})
+)
+
+;; Returns current operational status of the bridge
+(define-read-only (get-bridge-status)
+    (var-get bridge-paused)
+)
+
+;; Verifies if a principal is an authorized validator
+(define-read-only (get-validator-status (validator principal))
+    (default-to false (map-get? validators validator))
+)
+
+;; Retrieves the current bridge balance for a specific user
+(define-read-only (get-bridge-balance (user principal))
+    (default-to u0 (map-get? bridge-balances user))
+)
+
+;; Returns total amount of assets currently bridged
+(define-read-only (get-total-bridged-amount)
+    (var-get total-bridged-amount)
+)
+
+;; VALIDATION HELPER FUNCTIONS
+
+;; Validates principal address format and restrictions
+(define-read-only (is-valid-principal (address principal))
+    (and 
+        (not (is-eq address CONTRACT-DEPLOYER))
+        (not (is-eq address (as-contract tx-sender)))
+    )
+)
+
+;; Validates Bitcoin address format and length requirements
+(define-read-only (is-valid-btc-address (btc-addr (buff 33)))
+    (and
+        (is-eq (len btc-addr) u33)
+        (not (is-eq btc-addr 0x000000000000000000000000000000000000000000000000000000000000000000))
+        true
+    )
+)
+
+;; Validates transaction hash format and prevents null values
+(define-read-only (is-valid-tx-hash (tx-hash (buff 32)))
+    (and
+        (is-eq (len tx-hash) u32)
+        (not (is-eq tx-hash 0x0000000000000000000000000000000000000000000000000000000000000000))
+        true
+    )
+)
+
+;; Validates cryptographic signature format and length
+(define-read-only (is-valid-signature (signature (buff 65)))
+    (and
+        (is-eq (len signature) u65)
+        (not (is-eq signature 0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000))
+        true
+    )
+)
+
+;; Validates deposit amount within configured min/max limits
+(define-read-only (validate-deposit-amount (amount uint))
+    (and 
+        (>= amount MIN-DEPOSIT-AMOUNT)
+        (<= amount MAX-DEPOSIT-AMOUNT)
+    )
+)
