@@ -47,6 +47,8 @@
 (define-constant MIN-DEPOSIT-AMOUNT u100000)          ;; 0.001 BTC (in satoshis)
 (define-constant MAX-DEPOSIT-AMOUNT u1000000000)      ;; 10 BTC (in satoshis)
 (define-constant REQUIRED-CONFIRMATIONS u6)           ;; Bitcoin confirmation requirement
+(define-constant MAX-DAILY-WITHDRAWAL u50000000)      ;; e.g., 0.5 BTC in satoshis
+
 
 ;; DATA VARIABLES
 
@@ -80,6 +82,14 @@
 
 ;; Tracks user balances within the bridge
 (define-map bridge-balances principal uint)
+
+;; We'll calculate the "day" as stacks-block-height / 1440 (assuming ~1 block per minute, adjust as needed for your network).
+(define-map user-daily-withdrawals
+    principal        ;; user
+    { amount: uint,  ;; withdrawn today
+      day: uint }    ;; current day number
+)
+
 
 ;; ADMINISTRATIVE FUNCTIONS
 
@@ -225,16 +235,23 @@
 )
     (let (
         (current-balance (get-bridge-balance tx-sender))
+        (day (current-day))
+        (user-record (default-to {amount: u0, day: day} (map-get? user-daily-withdrawals tx-sender)))
+        (daily-withdrawn (if (is-eq (get day user-record) day) (get amount user-record) u0))
+        (new-daily-total (+ daily-withdrawn amount))
     )
         (asserts! (not (var-get bridge-paused)) (err ERROR-BRIDGE-PAUSED))
         (asserts! (>= current-balance amount) (err ERROR-INSUFFICIENT-BALANCE))
         (asserts! (validate-deposit-amount amount) (err ERROR-INVALID-AMOUNT))
-        
-        (map-set bridge-balances
-            tx-sender
-            (- current-balance amount)
-        )
-        
+        (asserts! (<= new-daily-total MAX-DAILY-WITHDRAWAL) (err u1012)) ;; ERROR-DAILY-LIMIT-EXCEEDED
+
+        ;; update user balance
+        (map-set bridge-balances tx-sender (- current-balance amount))
+
+        ;; update daily withdrawals
+        (map-set user-daily-withdrawals tx-sender { amount: new-daily-total, day: day })
+
+        ;; log withdrawal
         (print {
             type: "withdraw",
             sender: tx-sender,
@@ -242,7 +259,8 @@
             btc-recipient: btc-recipient,
             timestamp: stacks-block-height
         })
-        
+
+        ;; update total bridged amount
         (var-set total-bridged-amount (- (var-get total-bridged-amount) amount))
         (ok true)
     )
@@ -336,4 +354,8 @@
         (>= amount MIN-DEPOSIT-AMOUNT)
         (<= amount MAX-DEPOSIT-AMOUNT)
     )
+)
+
+(define-read-only (current-day)
+    (/ stacks-block-height u1440) ;; integer division
 )
