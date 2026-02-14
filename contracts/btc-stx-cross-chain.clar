@@ -53,6 +53,7 @@
 (define-data-var bridge-paused bool false)
 (define-data-var total-bridged-amount uint u0)
 (define-data-var last-processed-height uint u0)
+(define-data-var validator-count uint u0)
 
 ;; DATA MAPS
 
@@ -88,6 +89,16 @@
     (begin
         (asserts! (is-eq tx-sender CONTRACT-DEPLOYER) (err ERROR-NOT-AUTHORIZED))
         (var-set bridge-paused false)
+        
+        (print {
+            event: "bridge-initialized",
+            deployer: CONTRACT-DEPLOYER,
+            timestamp: stacks-block-height,
+            min-deposit: MIN-DEPOSIT-AMOUNT,
+            max-deposit: MAX-DEPOSIT-AMOUNT,
+            required-confirmations: REQUIRED-CONFIRMATIONS
+        })
+        
         (ok true)
     )
 )
@@ -96,7 +107,16 @@
 (define-public (pause-bridge)
     (begin
         (asserts! (is-eq tx-sender CONTRACT-DEPLOYER) (err ERROR-NOT-AUTHORIZED))
-        (var-set bridge-paused true)
+        (let ((previous-state (var-get bridge-paused)))
+            (var-set bridge-paused true)
+            (print {
+                event: "bridge-paused",
+                previous-state: previous-state,
+                new-state: true,
+                executor: tx-sender,
+                timestamp: stacks-block-height
+            })
+        )
         (ok true)
     )
 )
@@ -107,6 +127,14 @@
         (asserts! (is-eq tx-sender CONTRACT-DEPLOYER) (err ERROR-NOT-AUTHORIZED))
         (asserts! (var-get bridge-paused) (err ERROR-INVALID-BRIDGE-STATUS))
         (var-set bridge-paused false)
+        
+        (print {
+            event: "bridge-resumed",
+            new-state: false,
+            executor: tx-sender,
+            timestamp: stacks-block-height
+        })
+        
         (ok true)
     )
 )
@@ -116,7 +144,18 @@
     (begin
         (asserts! (is-eq tx-sender CONTRACT-DEPLOYER) (err ERROR-NOT-AUTHORIZED))
         (asserts! (is-valid-principal validator) (err ERROR-INVALID-VALIDATOR-ADDRESS))
+        
         (map-set validators validator true)
+        (var-set validator-count (+ (var-get validator-count) u1))
+        
+        (print {
+            event: "validator-added",
+            validator: validator,
+            added-by: tx-sender,
+            total-validators: (+ (var-get validator-count) u1),
+            timestamp: stacks-block-height
+        })
+        
         (ok true)
     )
 )
@@ -126,7 +165,19 @@
     (begin
         (asserts! (is-eq tx-sender CONTRACT-DEPLOYER) (err ERROR-NOT-AUTHORIZED))
         (asserts! (is-valid-principal validator) (err ERROR-INVALID-VALIDATOR-ADDRESS))
+        (asserts! (get-validator-status validator) (err ERROR-INVALID-VALIDATOR-ADDRESS))
+        
         (map-set validators validator false)
+        (var-set validator-count (- (var-get validator-count) u1))
+        
+        (print {
+            event: "validator-removed",
+            validator: validator,
+            removed-by: tx-sender,
+            total-validators: (- (var-get validator-count) u1),
+            timestamp: stacks-block-height
+        })
+        
         (ok true)
     )
 )
@@ -163,6 +214,18 @@
                 {tx-hash: tx-hash}
                 validated-deposit
             )
+            
+            (print {
+                event: "deposit-initiated",
+                tx-hash: tx-hash,
+                amount: amount,
+                recipient: recipient,
+                btc-sender: btc-sender,
+                initiated-by: tx-sender,
+                confirmations-required: REQUIRED-CONFIRMATIONS,
+                timestamp: stacks-block-height
+            })
+            
             (ok true)
         )
     )
@@ -204,15 +267,47 @@
                 (merge deposit {processed: true})
             )
             
-            (map-set bridge-balances
-                (get recipient deposit)
-                (+ (default-to u0 (map-get? bridge-balances (get recipient deposit))) 
-                   (get amount deposit))
+            (let ((old-balance (default-to u0 (map-get? bridge-balances (get recipient deposit))))
+                  (new-balance (+ (default-to u0 (map-get? bridge-balances (get recipient deposit))) (get amount deposit))))
+                (map-set bridge-balances
+                    (get recipient deposit)
+                    new-balance
+                )
+                
+                (print {
+                    event: "balance-updated",
+                    user: (get recipient deposit),
+                    old-balance: old-balance,
+                    new-balance: new-balance,
+                    change: (get amount deposit),
+                    operation: "deposit-credit"
+                })
             )
             
             (var-set total-bridged-amount 
                 (+ (var-get total-bridged-amount) (get amount deposit))
             )
+            
+            (print {
+                event: "signature-recorded",
+                tx-hash: tx-hash,
+                validator: tx-sender,
+                signature: signature,
+                timestamp: stacks-block-height
+            })
+            
+            (print {
+                event: "deposit-confirmed",
+                tx-hash: tx-hash,
+                amount: (get amount deposit),
+                recipient: (get recipient deposit),
+                btc-sender: (get btc-sender deposit),
+                confirmed-by: tx-sender,
+                confirmations-received: (+ (get confirmations deposit) u1),
+                new-bridge-balance: (var-get total-bridged-amount),
+                timestamp: stacks-block-height
+            })
+            
             (ok true)
         )
     )
@@ -225,25 +320,51 @@
 )
     (let (
         (current-balance (get-bridge-balance tx-sender))
+        (old-total (var-get total-bridged-amount))
     )
         (asserts! (not (var-get bridge-paused)) (err ERROR-BRIDGE-PAUSED))
         (asserts! (>= current-balance amount) (err ERROR-INSUFFICIENT-BALANCE))
         (asserts! (validate-deposit-amount amount) (err ERROR-INVALID-AMOUNT))
         
-        (map-set bridge-balances
-            tx-sender
-            (- current-balance amount)
+        (let ((new-balance (- current-balance amount)))
+            (map-set bridge-balances
+                tx-sender
+                new-balance
+            )
+            
+            (print {
+                event: "balance-updated",
+                user: tx-sender,
+                old-balance: current-balance,
+                new-balance: new-balance,
+                change: amount,
+                operation: "withdraw-debit"
+            })
         )
         
+        (var-set total-bridged-amount (- (var-get total-bridged-amount) amount))
+        
         (print {
-            type: "withdraw",
+            event: "withdraw",
             sender: tx-sender,
             amount: amount,
             btc-recipient: btc-recipient,
+            remaining-balance: (- current-balance amount),
+            total-bridged-before: old-total,
+            total-bridged-after: (var-get total-bridged-amount),
             timestamp: stacks-block-height
         })
         
-        (var-set total-bridged-amount (- (var-get total-bridged-amount) amount))
+        (print {
+            event: "withdrawal-processed",
+            withdrawal-id: (var-get last-processed-height),
+            sender: tx-sender,
+            amount: amount,
+            recipient-btc: btc-recipient,
+            status: "completed",
+            timestamp: stacks-block-height
+        })
+        
         (ok true)
     )
 )
@@ -257,12 +378,62 @@
         
         (let (
             (current-balance (default-to u0 (map-get? bridge-balances recipient)))
+            (old-total (var-get total-bridged-amount))
             (new-balance (+ current-balance amount))
         )
             (asserts! (> new-balance current-balance) (err ERROR-INVALID-AMOUNT))
             (map-set bridge-balances recipient new-balance)
+            
+            (print {
+                event: "balance-updated",
+                user: recipient,
+                old-balance: current-balance,
+                new-balance: new-balance,
+                change: amount,
+                operation: "emergency-credit"
+            })
+            
+            (print {
+                event: "emergency-withdrawal",
+                executor: tx-sender,
+                amount: amount,
+                recipient: recipient,
+                total-bridged-before: old-total,
+                total-bridged-after: (var-get total-bridged-amount),
+                reason: "emergency",
+                timestamp: stacks-block-height
+            })
+            
             (ok true)
         )
+    )
+)
+
+;; Add confirmation count function
+(define-public (add-confirmation (tx-hash (buff 32)))
+    (let (
+        (deposit (unwrap! (map-get? deposits {tx-hash: tx-hash}) (err ERROR-INVALID-BRIDGE-STATUS)))
+        (is-validator (get-validator-status tx-sender))
+    )
+        (asserts! (not (get processed deposit)) (err ERROR-ALREADY-PROCESSED))
+        (asserts! is-validator (err ERROR-NOT-AUTHORIZED))
+        
+        (map-set deposits
+            {tx-hash: tx-hash}
+            (merge deposit {confirmations: (+ (get confirmations deposit) u1)})
+        )
+        
+        (print {
+            event: "confirmation-added",
+            tx-hash: tx-hash,
+            validator: tx-sender,
+            current-confirmations: (+ (get confirmations deposit) u1),
+            required-confirmations: REQUIRED-CONFIRMATIONS,
+            ready-for-processing: (>= (+ (get confirmations deposit) u1) REQUIRED-CONFIRMATIONS),
+            timestamp: stacks-block-height
+        })
+        
+        (ok true)
     )
 )
 
@@ -291,6 +462,11 @@
 ;; Returns total amount of assets currently bridged
 (define-read-only (get-total-bridged-amount)
     (var-get total-bridged-amount)
+)
+
+;; Returns validator count
+(define-read-only (get-validator-count)
+    (var-get validator-count)
 )
 
 ;; VALIDATION HELPER FUNCTIONS
